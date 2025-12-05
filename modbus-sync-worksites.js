@@ -11,7 +11,7 @@ const ModbusRTU = require("modbus-serial");
 // Set DEBUG_LOG = false in production to avoid verbose logs.
 // Errors (console.error) are always logged.
 
-const DEBUG_LOG = true;
+const DEBUG_LOG = false;
 
 function dlog(...args) {
   if (DEBUG_LOG) console.log(...args);
