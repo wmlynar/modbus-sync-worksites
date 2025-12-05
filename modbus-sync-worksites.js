@@ -163,6 +163,18 @@ const modbusStates = new Map();
 
 const siteDebounceStates = new Map();
 
+// --- CUSTOM ERROR TYPES ---
+
+class ModbusBackoffError extends Error {
+  constructor(groupKey, sinceLastMs, backoffMs) {
+    super(`Reconnect backoff for group ${groupKey}: ${sinceLastMs}ms < ${backoffMs}ms`);
+    this.name = "ModbusBackoffError";
+    this.groupKey = groupKey;
+    this.sinceLastMs = sinceLastMs;
+    this.backoffMs = backoffMs;
+  }
+}
+
 // --- HELPERS ---
 
 function sleep(ms) {
@@ -183,13 +195,6 @@ function defaultToBool(defaultState) {
 //   - if rawVal === defaultBool → effectiveVal = defaultBool immediately,
 //   - if rawVal !== defaultBool → only after FILL_DEBOUNCE_MS of continuous opposite
 //                                 signal we switch effectiveVal to the opposite.
-// That means:
-//   - state stays "default" unless we have *stable* opposite signal,
-//   - any glitches quickly pull us back to default.
-//
-// Examples:
-//   - PICK (default=EMPTY): we need stable "full" to consider something present,
-//   - DROP (default=FILLED): we need stable "empty" to consider it safe to drop.
 
 function updateDebouncedState(site, rawVal, now) {
   const siteId = site.siteId;
@@ -243,11 +248,10 @@ async function readInputsForGroup(group) {
   // No client yet or connection was closed – try to connect (with backoff).
   if (!state.client) {
     const sinceLast = now - state.lastAttempt;
+
     if (state.lastAttempt !== 0 && sinceLast < RECONNECT_BACKOFF_MS) {
-      // Still in backoff window – this is informational, not an error.
-      throw new Error(
-        `Modbus ${group.key}: reconnect backoff (${sinceLast}ms < ${RECONNECT_BACKOFF_MS}ms)`
-      );
+      // Backoff in progress – this is not a real error, just "too early".
+      throw new ModbusBackoffError(group.key, sinceLast, RECONNECT_BACKOFF_MS);
     }
 
     state.lastAttempt = now;
@@ -268,7 +272,7 @@ async function readInputsForGroup(group) {
 
       dlog(`Connected to Modbus ${group.key}`);
     } catch (err) {
-      // Connection failed: clean state and rethrow.
+      // Connection failed: clean state and rethrow as a normal error.
       try {
         if (state.client) state.client.close();
       } catch (_) {}
@@ -314,7 +318,7 @@ async function readInputsForGroup(group) {
 
     return inputs;
   } catch (err) {
-    // Read failed: clean state and rethrow.
+    // Read failed: clean state and rethrow as a normal error.
     try {
       if (state.client) state.client.close();
     } catch (_) {}
@@ -383,18 +387,17 @@ async function syncOnce(api) {
     try {
       inputs = await readInputsForGroup(group);
     } catch (err) {
-      const errMsg = err && err.message ? err.message : String(err);
-
-      if (errMsg.includes("reconnect backoff")) {
-        // This is just "we are still waiting before next connect attempt".
-        // Debug-only, no need to spam production logs or rewrite defaults every time.
+      if (err instanceof ModbusBackoffError) {
+        // This is only "we are still waiting before next reconnect" – debug only.
         dlog(
-          `[Modbus] Group ${key}: reconnect backoff active. Details: ${errMsg}`
+          `[Modbus] Group ${err.groupKey}: reconnect backoff active (${err.sinceLastMs}ms < ${err.backoffMs}ms)`
         );
+        // Do NOT overwrite defaults again here – they were already set on the last real error.
         continue;
       }
 
-      // Real communication error: log visibly and set defaults once.
+      const errMsg = err && err.message ? err.message : String(err);
+      // Real communication error: log visibly and set defaults.
       console.error(
         `[Modbus] Group ${key}: communication error, using default states. Details: ${errMsg}`
       );
