@@ -242,9 +242,11 @@ async function readInputsForGroup(group) {
 
   // No client yet or connection was closed – try to connect (with backoff).
   if (!state.client) {
-    if (now - state.lastAttempt < RECONNECT_BACKOFF_MS) {
+    const sinceLast = now - state.lastAttempt;
+    if (state.lastAttempt !== 0 && sinceLast < RECONNECT_BACKOFF_MS) {
+      // Still in backoff window – this is informational, not an error.
       throw new Error(
-        `Modbus ${group.key}: reconnect backoff (${now - state.lastAttempt}ms < ${RECONNECT_BACKOFF_MS}ms)`
+        `Modbus ${group.key}: reconnect backoff (${sinceLast}ms < ${RECONNECT_BACKOFF_MS}ms)`
       );
     }
 
@@ -271,7 +273,7 @@ async function readInputsForGroup(group) {
         if (state.client) state.client.close();
       } catch (_) {}
       state.client = null;
-      state.lastAttempt = Date.now();
+      state.lastAttempt = now;
       throw err;
     }
   }
@@ -382,13 +384,21 @@ async function syncOnce(api) {
       inputs = await readInputsForGroup(group);
     } catch (err) {
       const errMsg = err && err.message ? err.message : String(err);
-      const ctx = `Modbus communication error for group ${key}: ${errMsg}`;
 
-      // This is the central place where we log Modbus communication problems:
+      if (errMsg.includes("reconnect backoff")) {
+        // This is just "we are still waiting before next connect attempt".
+        // Debug-only, no need to spam production logs or rewrite defaults every time.
+        dlog(
+          `[Modbus] Group ${key}: reconnect backoff active. Details: ${errMsg}`
+        );
+        continue;
+      }
+
+      // Real communication error: log visibly and set defaults once.
       console.error(
         `[Modbus] Group ${key}: communication error, using default states. Details: ${errMsg}`
       );
-
+      const ctx = `Modbus communication error for group ${key}: ${errMsg}`;
       resetDebounceForSites(sites);
       await setSitesDefault(api, sites, ctx);
       continue;
