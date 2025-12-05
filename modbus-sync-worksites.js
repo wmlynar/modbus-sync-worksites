@@ -1,15 +1,16 @@
 // modbus-sync-worksites.js
 //
-// Synchronization of RDS work sites (FILLED/EMPTY) based on Modbus discrete inputs,
-// with debouncing and per-site default state for error / unstable signal cases.
+// Synchronize RDS worksites (FILLED / EMPTY) based on Modbus discrete inputs.
+// Each site has:
+//   - Modbus mapping (ip, port, slaveId, offset)
+//   - default logical state (EMPTY / FILLED)
+// Debounce:
+//   - state stays "default" unless sensor is stably opposite to default for FILL_DEBOUNCE_MS.
 
 const { APIClient } = require("./api-client");
 const ModbusRTU = require("modbus-serial");
 
-// --- LOGGING (DEBUG) ---
-//
-// Set DEBUG_LOG = false in production to avoid verbose logs.
-// Errors (console.error) are always logged.
+// --- DEBUG LOGGING -----------------------------------------------------------
 
 const DEBUG_LOG = false;
 
@@ -17,7 +18,7 @@ function dlog(...args) {
   if (DEBUG_LOG) console.log(...args);
 }
 
-// --- GLOBAL ERROR HANDLERS ---
+// --- GLOBAL ERROR HANDLERS ---------------------------------------------------
 
 process.on("unhandledRejection", (err) => {
   console.error("UNHANDLED REJECTION:", err && err.stack ? err.stack : err);
@@ -27,78 +28,58 @@ process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err && err.stack ? err.stack : err);
 });
 
-// --- RDS CONFIG (hard-coded for now) ---
+// --- RDS CONFIG --------------------------------------------------------------
 
 const RDS_HOST = "http://10.6.44.2:8080";
 const RDS_USER = "admin";
 const RDS_PASS = "123456";
 const RDS_LANG = "en";
 
-// --- MODBUS CONFIG ---
+// --- MODBUS CONFIG -----------------------------------------------------------
 
-// Timeout for a single Modbus request (in ms).
-// After this time readDiscreteInputs / connectTCP will fail and we handle the error.
-const MODBUS_REQUEST_TIMEOUT_MS = 1000; // 1 second
+const MODBUS_REQUEST_TIMEOUT_MS = 1000; // timeout of a single Modbus request (ms)
+const POLL_INTERVAL_MS         = 500;  // how often we run syncOnce (ms)
+const RECONNECT_BACKOFF_MS     = 5000; // min time between connect attempts (per group)
 
-// --- MAIN LOOP CONFIG ---
+// --- DEBOUNCE CONFIG ---------------------------------------------------------
 
-const POLL_INTERVAL_MS = 500;       // how often we run a full sync
-const RECONNECT_BACKOFF_MS = 5000;  // minimum time between reconnect attempts per Modbus group
+const FILL_DEBOUNCE_MS = 2000; // ms of stable opposite signal to accept change
 
-// --- DEBOUNCE CONFIG ---
-//
-// How long (ms) the Modbus signal must stay opposite to the default state
-// to be accepted as a stable change.
-// If this condition is not met, the worksite stays in the default state.
-
-const FILL_DEBOUNCE_MS = 2000; // 2 seconds
-
-// --- LOGICAL STATES ---
+// --- LOGICAL STATES ----------------------------------------------------------
 
 const EMPTY  = "EMPTY";
 const FILLED = "FILLED";
 
-// --- WORKSITE -> MODBUS MAPPING ---
+// --- WORKSITE -> MODBUS MAPPING ---------------------------------------------
 //
-// offset = Modbus discrete input address = index in readDiscreteInputs().data
+// offset = Modbus discrete input address / index
 //
-// Fields:
-//   siteId   – worksite identifier in RDS
-//   ip, port – Modbus TCP address of the PLC
-//   slaveId  – Modbus slave ID
-//   offset   – discrete input address
-//   default  – EMPTY / FILLED (default logical state for this site)
+// default:
+//   - what state we assume when:
+//       * Modbus is down
+//       * debounce time is not yet satisfied
 //
-// Semantics of `default`:
-//   - used when Modbus communication fails,
-//   - used as the "safe" state when debouncing is not yet satisfied.
 // Examples:
-//   - pick locations: default = EMPTY  (assume nothing to pick until sensor confirms presence),
-//   - drop locations: default = FILLED (assume you cannot drop until sensor confirms emptiness).
+//   - pick locations: default = EMPTY  – assume nothing to pick until sensor confirms,
+//   - drop locations: default = FILLED – assume you cannot drop until sensor confirms empty.
 
 const SITES = [
-  // PLC 10.6.44.70, slaveId 255 – example sites:
-  { siteId: "PICK-01", ip: "10.6.44.70", port: 502, slaveId: 255, offset:  9, default: EMPTY  },
-  // { siteId: "PICK-02", ip: "10.6.44.70", port: 502, slaveId: 255, offset: 10, default: EMPTY  },
+  { siteId: "PICK-01", ip: "10.6.44.70", port: 502, slaveId: 255, offset: 9, default: EMPTY },
   // { siteId: "DROP-01", ip: "10.6.44.70", port: 502, slaveId: 255, offset: 11, default: FILLED },
-  // { siteId: "DROP-02", ip: "10.6.44.70", port: 502, slaveId: 255, offset: 12, default: FILLED },
 ];
 
-// --- CONFIG VALIDATION ---
-//
-// Fail fast on startup if something is clearly wrong.
+// --- CONFIG VALIDATION -------------------------------------------------------
 
 function validateConfig() {
-  const siteIds = new Set();
-
+  const ids = new Set();
   for (const s of SITES) {
     if (!s.siteId || typeof s.siteId !== "string") {
       throw new Error(`Invalid siteId in SITES: ${JSON.stringify(s)}`);
     }
-    if (siteIds.has(s.siteId)) {
+    if (ids.has(s.siteId)) {
       throw new Error(`Duplicate siteId in SITES: ${s.siteId}`);
     }
-    siteIds.add(s.siteId);
+    ids.add(s.siteId);
 
     if (!Number.isInteger(s.offset) || s.offset < 0) {
       throw new Error(`Invalid offset for ${s.siteId}: ${s.offset}`);
@@ -112,14 +93,16 @@ function validateConfig() {
 
 validateConfig();
 
-// --- GROUP SITES BY (ip, port, slaveId) ---
+// --- GROUP SITES BY MODBUS CONNECTION ---------------------------------------
+//
+// group = { key, ip, port, slaveId, sites[], minOffset, length }
 
 function groupSitesByConnection(sites) {
-  const groupsMap = new Map();
+  const map = new Map();
 
   for (const s of sites) {
     const key = `${s.ip}:${s.port}:${s.slaveId}`;
-    let g = groupsMap.get(key);
+    let g = map.get(key);
     if (!g) {
       g = {
         key,
@@ -130,14 +113,14 @@ function groupSitesByConnection(sites) {
         minOffset: s.offset,
         maxOffset: s.offset,
       };
-      groupsMap.set(key, g);
+      map.set(key, g);
     }
     g.sites.push(s);
     if (s.offset < g.minOffset) g.minOffset = s.offset;
     if (s.offset > g.maxOffset) g.maxOffset = s.offset;
   }
 
-  return Array.from(groupsMap.values()).map((g) => ({
+  return Array.from(map.values()).map((g) => ({
     key: g.key,
     ip: g.ip,
     port: g.port,
@@ -150,111 +133,98 @@ function groupSitesByConnection(sites) {
 
 const GROUPS = groupSitesByConnection(SITES);
 
-// --- MODBUS STATE: key -> { client|null, lastAttempt } ---
+// --- MODBUS STATE: one per group --------------------------------------------
+//
+// modbusStates[group.key] = { client|null, lastAttemptMs }
 
 const modbusStates = new Map();
 
-// --- DEBOUNCE STATE PER WORKSITE ---
+// --- DEBOUNCE STATE PER WORKSITE --------------------------------------------
 //
-// siteId -> {
-//   lastOppositeStartTs: number|null, // when we first saw raw != default
-//   effectiveVal: boolean             // debounced logical state (true = FILLED, false = EMPTY)
+// debounceStates[siteId] = {
+//   lastOppositeStartTs: number | null,
+//   effectiveVal: boolean (true=FILLED, false=EMPTY)
 // }
 
-const siteDebounceStates = new Map();
+const debounceStates = new Map();
 
-// --- CUSTOM ERROR TYPES ---
-
-class ModbusBackoffError extends Error {
-  constructor(groupKey, sinceLastMs, backoffMs) {
-    super(`Reconnect backoff for group ${groupKey}: ${sinceLastMs}ms < ${backoffMs}ms`);
-    this.name = "ModbusBackoffError";
-    this.groupKey = groupKey;
-    this.sinceLastMs = sinceLastMs;
-    this.backoffMs = backoffMs;
-  }
-}
-
-// --- HELPERS ---
+// --- HELPERS -----------------------------------------------------------------
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Convert EMPTY/FILLED to boolean (true = FILLED, false = EMPTY)
-function defaultToBool(defaultState) {
-  return defaultState === FILLED;
+function defaultToBool(def) {
+  return def === FILLED;
 }
 
-// Debounce with respect to default:
-//
-// defaultBool = default logical state (true/false)
-// rawVal      = raw Modbus bit (true = sensor sees "full")
-//
-// Rules:
-//   - if rawVal === defaultBool → effectiveVal = defaultBool immediately,
-//   - if rawVal !== defaultBool → only after FILL_DEBOUNCE_MS of continuous opposite
-//                                 signal we switch effectiveVal to the opposite.
-
+// Update debounced value for a single site.
+// rawVal = raw sensor bit (true/false).
 function updateDebouncedState(site, rawVal, now) {
-  const siteId = site.siteId;
-  const defaultBool = defaultToBool(site.default);
-  const oppositeBool = !defaultBool;
+  const siteId     = site.siteId;
+  const defaultVal = defaultToBool(site.default);
+  const opposite   = !defaultVal;
 
-  let st = siteDebounceStates.get(siteId);
+  let st = debounceStates.get(siteId);
   if (!st) {
-    st = {
-      lastOppositeStartTs: null,
-      effectiveVal: defaultBool,
-    };
-    siteDebounceStates.set(siteId, st);
+    st = { lastOppositeStartTs: null, effectiveVal: defaultVal };
+    debounceStates.set(siteId, st);
   }
 
-  if (rawVal === defaultBool) {
-    // Back to default state (or still there).
+  if (rawVal === defaultVal) {
+    // Sensor agrees with default -> immediately back to default.
     st.lastOppositeStartTs = null;
-    st.effectiveVal = defaultBool;
+    st.effectiveVal = defaultVal;
   } else {
-    // Raw signal is opposite to default.
+    // Sensor suggests opposite state.
     if (st.lastOppositeStartTs === null) {
+      // First time we see opposite signal.
       st.lastOppositeStartTs = now;
-      st.effectiveVal = defaultBool; // still default until debounce time passes
+      st.effectiveVal = defaultVal; // still default until delay passes
     } else if (now - st.lastOppositeStartTs >= FILL_DEBOUNCE_MS) {
-      st.effectiveVal = oppositeBool;
+      // Opposite signal held long enough -> accept change.
+      st.effectiveVal = opposite;
     }
-    // if not enough time passed → keep current effectiveVal
   }
 
-  return st.effectiveVal; // boolean: true = FILLED, false = EMPTY
+  return st.effectiveVal;
 }
 
 function resetDebounceForSites(sites) {
   for (const s of sites) {
-    siteDebounceStates.delete(s.siteId);
+    debounceStates.delete(s.siteId);
   }
 }
 
-// --- MODBUS: READ DISCRETE INPUTS FOR A GROUP WITH RECONNECT/BACKOFF ---
+// --- MODBUS: connect + read with simple backoff ------------------------------
+//
+// Returns:
+//   { status: "ok", inputs: boolean[] }
+//   { status: "backoff" }
+//   { status: "error", message: string }
 
 async function readInputsForGroup(group) {
   let state = modbusStates.get(group.key);
   const now = Date.now();
 
   if (!state) {
-    state = { client: null, lastAttempt: 0 };
+    state = { client: null, lastAttemptMs: 0 };
     modbusStates.set(group.key, state);
   }
 
-  // No client yet or connection was closed – try to connect (with backoff).
+  // 1) Need client: try to (re)connect, but respect backoff.
   if (!state.client) {
-    const sinceLast = now - state.lastAttempt;
+    const sinceLast = now - state.lastAttemptMs;
 
-    if (state.lastAttempt !== 0 && sinceLast < RECONNECT_BACKOFF_MS) {
-      // Backoff in progress – this is not a real error, just "too early".
-      throw new ModbusBackoffError(group.key, sinceLast, RECONNECT_BACKOFF_MS);
+    if (state.lastAttemptMs !== 0 && sinceLast < RECONNECT_BACKOFF_MS) {
+      // Still waiting before next connect attempt.
+      dlog(
+        `[Modbus] Group ${group.key}: reconnect backoff ${sinceLast}ms < ${RECONNECT_BACKOFF_MS}ms`
+      );
+      return { status: "backoff" };
     }
 
-    state.lastAttempt = now;
+    state.lastAttemptMs = now;
 
     try {
       const client = new ModbusRTU();
@@ -272,17 +242,16 @@ async function readInputsForGroup(group) {
 
       dlog(`Connected to Modbus ${group.key}`);
     } catch (err) {
-      // Connection failed: clean state and rethrow as a normal error.
-      try {
-        if (state.client) state.client.close();
-      } catch (_) {}
-      state.client = null;
-      state.lastAttempt = now;
-      throw err;
+      const msg = err && err.message ? err.message : String(err);
+      // Connection failed, keep client=null, we will backoff next time.
+      return {
+        status: "error",
+        message: `connect failed: ${msg}`,
+      };
     }
   }
 
-  // We have a client – read discrete inputs.
+  // 2) We have client: read discrete inputs.
   try {
     const startAddr  = group.minOffset;
     const readLength = group.sites.length === 1 ? 1 : group.length;
@@ -304,31 +273,37 @@ async function readInputsForGroup(group) {
 
     const inputs = raw && Array.isArray(raw.data) ? raw.data : null;
     if (!inputs) {
-      throw new Error(
-        `Invalid response format from readDiscreteInputs for ${group.key}`
-      );
+      return {
+        status: "error",
+        message: "invalid readDiscreteInputs response format",
+      };
     }
 
     const maxAddr = startAddr + inputs.length - 1;
-
     dlog(
       `[MODBUS-RESP] ${group.key} len=${inputs.length} inputs[${startAddr}..${maxAddr}] =`,
       inputs
     );
 
-    return inputs;
+    return { status: "ok", inputs };
   } catch (err) {
-    // Read failed: clean state and rethrow as a normal error.
+    const msg = err && err.message ? err.message : String(err);
+
+    // Reading failed: close client, so next call will reconnect (with backoff).
     try {
       if (state.client) state.client.close();
     } catch (_) {}
     state.client = null;
-    state.lastAttempt = Date.now();
-    throw err;
+    state.lastAttemptMs = Date.now();
+
+    return {
+      status: "error",
+      message: `readDiscreteInputs failed: ${msg}`,
+    };
   }
 }
 
-// --- RDS: WRITE WORKSITE STATE (shared helper) ---
+// --- RDS: write worksite state ----------------------------------------------
 //
 // filledBool: true = FILLED, false = EMPTY
 
@@ -340,20 +315,19 @@ async function writeWorksiteState(api, site, filledBool, context) {
       await api.setWorkSiteEmpty(site.siteId);
     }
 
-    // Success is debug-level info – only log when DEBUG_LOG = true.
+    // Success is debug-level info.
     dlog(
       `[RDS] Worksite ${site.siteId} => ${filledBool ? "FILLED" : "EMPTY"} (${context})`
     );
   } catch (err) {
-    // Errors are always logged.
+    const msg = err && err.message ? err.message : String(err);
     console.error(
-      `[RDS] Failed to update worksite ${site.siteId} (${context}):`,
-      err && err.message ? err.message : err
+      `[RDS] Failed to update worksite ${site.siteId} (${context}): ${msg}`
     );
   }
 }
 
-// --- APPLY DEFAULT STATE (used on Modbus error / missing value) ---
+// --- Apply default state (used on Modbus error / missing value) --------------
 
 async function setSitesDefault(api, sites, context) {
   for (const s of sites) {
@@ -363,7 +337,7 @@ async function setSitesDefault(api, sites, context) {
   }
 }
 
-// --- ONE SYNC CYCLE ---
+// --- ONE SYNC CYCLE ----------------------------------------------------------
 
 async function syncOnce(api) {
   if (!api.sessionId) {
@@ -371,41 +345,34 @@ async function syncOnce(api) {
       await api.login();
       dlog("[RDS] Initial login succeeded.");
     } catch (err) {
-      console.error(
-        "[RDS] Initial login failed:",
-        err && err.message ? err.message : err
-      );
-      // Do not abort – APIClient may retry inside its own methods.
+      const msg = err && err.message ? err.message : String(err);
+      console.error("[RDS] Initial login failed:", msg);
+      // Continue – APIClient may retry on its own.
     }
   }
 
   for (const group of GROUPS) {
     const { sites, minOffset } = group;
-    const key = group.key;
 
-    let inputs;
-    try {
-      inputs = await readInputsForGroup(group);
-    } catch (err) {
-      if (err instanceof ModbusBackoffError) {
-        // This is only "we are still waiting before next reconnect" – debug only.
-        dlog(
-          `[Modbus] Group ${err.groupKey}: reconnect backoff active (${err.sinceLastMs}ms < ${err.backoffMs}ms)`
-        );
-        // Do NOT overwrite defaults again here – they were already set on the last real error.
-        continue;
-      }
+    const result = await readInputsForGroup(group);
 
-      const errMsg = err && err.message ? err.message : String(err);
-      // Real communication error: log visibly and set defaults.
-      console.error(
-        `[Modbus] Group ${key}: communication error, using default states. Details: ${errMsg}`
-      );
-      const ctx = `Modbus communication error for group ${key}: ${errMsg}`;
-      resetDebounceForSites(sites);
-      await setSitesDefault(api, sites, ctx);
+    if (result.status === "backoff") {
+      // We are in reconnect backoff window -> keep current RDS state, do nothing.
       continue;
     }
+
+    if (result.status === "error") {
+      // Real communication problem -> log once per cycle and use defaults.
+      console.error(
+        `[Modbus] Group ${group.key}: communication error, using default states. Details: ${result.message}`
+      );
+      resetDebounceForSites(sites);
+      await setSitesDefault(api, sites, `Modbus error for group ${group.key}: ${result.message}`);
+      continue;
+    }
+
+    // status === "ok"
+    const inputs = result.inputs;
 
     for (const s of sites) {
       const idx = s.offset - minOffset;
@@ -428,8 +395,6 @@ async function syncOnce(api) {
         `[DEBOUNCE] siteId=${s.siteId} raw=${!!rawVal} default=${s.default} -> debounced=${effectiveBool ? "FILLED" : "EMPTY"}`
       );
 
-      // This process is not the only one that may change RDS,
-      // so we always overwrite the worksite state with the current debounced value.
       await writeWorksiteState(
         api,
         s,
@@ -440,7 +405,7 @@ async function syncOnce(api) {
   }
 }
 
-// --- CLEANUP MODBUS CLIENTS ON EXIT ---
+// --- CLEANUP ON EXIT ---------------------------------------------------------
 
 function closeAllModbusClients() {
   for (const [key, state] of modbusStates.entries()) {
@@ -466,7 +431,7 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-// --- MAIN LOOP ---
+// --- MAIN LOOP ---------------------------------------------------------------
 
 async function mainLoop() {
   const api = new APIClient(RDS_HOST, RDS_USER, RDS_PASS, RDS_LANG);
@@ -480,10 +445,8 @@ async function mainLoop() {
     try {
       await syncOnce(api);
     } catch (err) {
-      console.error(
-        "Global error in syncOnce:",
-        err && err.stack ? err.stack : err
-      );
+      const msg = err && err.stack ? err.stack : err;
+      console.error("Global error in syncOnce:", msg);
     }
 
     const elapsed = Date.now() - start;
@@ -494,12 +457,10 @@ async function mainLoop() {
   }
 }
 
-// --- START ---
+// --- START -------------------------------------------------------------------
 
 mainLoop().catch((err) => {
-  console.error(
-    "Fatal error in mainLoop:",
-    err && err.stack ? err.stack : err
-  );
+  const msg = err && err.stack ? err.stack : err;
+  console.error("Fatal error in mainLoop:", msg);
   closeAllModbusClients();
 });
