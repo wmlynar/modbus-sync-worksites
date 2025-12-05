@@ -37,7 +37,7 @@ const RDS_LANG = "en";
 // --- MODBUS CONFIG ---
 
 // Timeout for a single Modbus request (in ms).
-// After this time readDiscreteInputs will fail and we handle the error.
+// After this time readDiscreteInputs / connectTCP will fail and we handle the error.
 const MODBUS_REQUEST_TIMEOUT_MS = 1000; // 1 second
 
 // --- MAIN LOOP CONFIG ---
@@ -266,6 +266,12 @@ async function readInputsForGroup(group) {
 
       dlog(`Connected to Modbus ${group.key}`);
     } catch (err) {
+      // Connection failed: clean state and rethrow.
+      try {
+        if (state.client) state.client.close();
+      } catch (_) {}
+      state.client = null;
+      state.lastAttempt = Date.now();
       throw err;
     }
   }
@@ -306,17 +312,12 @@ async function readInputsForGroup(group) {
 
     return inputs;
   } catch (err) {
-    console.error(
-      `Modbus group ${group.key}: readDiscreteInputs failed, will fall back to default states:`,
-      err && err.message ? err.message : err
-    );
-
+    // Read failed: clean state and rethrow.
     try {
-      state.client.close();
+      if (state.client) state.client.close();
     } catch (_) {}
     state.client = null;
     state.lastAttempt = Date.now();
-
     throw err;
   }
 }
@@ -333,10 +334,12 @@ async function writeWorksiteState(api, site, filledBool, context) {
       await api.setWorkSiteEmpty(site.siteId);
     }
 
+    // Success is debug-level info – only log when DEBUG_LOG = true.
     dlog(
       `[RDS] Worksite ${site.siteId} => ${filledBool ? "FILLED" : "EMPTY"} (${context})`
     );
   } catch (err) {
+    // Errors are always logged.
     console.error(
       `[RDS] Failed to update worksite ${site.siteId} (${context}):`,
       err && err.message ? err.message : err
@@ -379,7 +382,13 @@ async function syncOnce(api) {
       inputs = await readInputsForGroup(group);
     } catch (err) {
       const errMsg = err && err.message ? err.message : String(err);
-      const ctx = `Modbus communication error for ${key}: ${errMsg}`;
+      const ctx = `Modbus communication error for group ${key}: ${errMsg}`;
+
+      // This is the central place where we log Modbus communication problems:
+      console.error(
+        `[Modbus] Group ${key}: communication error, using default states. Details: ${errMsg}`
+      );
+
       resetDebounceForSites(sites);
       await setSitesDefault(api, sites, ctx);
       continue;
